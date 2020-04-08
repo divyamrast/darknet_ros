@@ -58,6 +58,7 @@ bool YoloObjectDetector::readParameters()
   nodeHandle_.param("image_view/enable_opencv", viewImage_, true);
   nodeHandle_.param("image_view/wait_key_delay", waitKeyDelay_, 3);
   nodeHandle_.param("image_view/enable_console_output", enableConsoleOutput_, false);
+  nodeHandle_.param("publish_goal", publishGoal_, false);
 
   // Check if Xserver is running on Linux.
   if (XOpenDisplay(NULL)) {
@@ -138,6 +139,7 @@ void YoloObjectDetector::init()
   std::string detectionImageTopicName;
   int detectionImageQueueSize;
   bool detectionImageLatch;
+  std::string depthTopicName;
 
   nodeHandle_.param("subscribers/camera_reading/topic", cameraTopicName,
                     std::string("/camera/image_raw"));
@@ -154,9 +156,17 @@ void YoloObjectDetector::init()
                     std::string("detection_image"));
   nodeHandle_.param("publishers/detection_image/queue_size", detectionImageQueueSize, 1);
   nodeHandle_.param("publishers/detection_image/latch", detectionImageLatch, true);
+  nodeHandle_.param("subscribers/depth_reading/topic", depthTopicName,
+                    std::string("/camera/depth/image"));
 
-  imageSubscriber_ = imageTransport_.subscribe(cameraTopicName, cameraQueueSize,
-                                               &YoloObjectDetector::cameraCallback, this);
+  depthImage_.subscribe(imageTransport_, depthTopicName, 5);
+  cameraImage_.subscribe(imageTransport_, cameraTopicName, 5);
+  sync.reset(new Sync(sync_policy(5), cameraImage_, depthImage_));
+  sync->registerCallback(boost::bind(&YoloObjectDetector::cameraCallback, this, _1, _2));
+  pub_goal = nodeHandle_.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 1);
+
+//  imageSubscriber_ = imageTransport_.subscribe(cameraTopicName, cameraQueueSize,
+//                                               &YoloObjectDetector::cameraCallback, this);
   objectPublisher_ = nodeHandle_.advertise<darknet_ros_msgs::ObjectCount>(objectDetectorTopicName,
                                                                             objectDetectorQueueSize,
                                                                             objectDetectorLatch);
@@ -179,14 +189,16 @@ void YoloObjectDetector::init()
   checkForObjectsActionServer_->start();
 }
 
-void YoloObjectDetector::cameraCallback(const sensor_msgs::ImageConstPtr& msg)
+void YoloObjectDetector::cameraCallback(const sensor_msgs::ImageConstPtr& msg1, const sensor_msgs::ImageConstPtr& msg2)
 {
   ROS_DEBUG("[YoloObjectDetector] USB image received.");
 
   cv_bridge::CvImagePtr cam_image;
+  cv_bridge::CvImagePtr depth_image;
 
   try {
-    cam_image = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+    cam_image = cv_bridge::toCvCopy(msg1, sensor_msgs::image_encodings::BGR8);
+    depth_image = cv_bridge::toCvCopy(msg2);
   } catch (cv_bridge::Exception& e) {
     ROS_ERROR("cv_bridge exception: %s", e.what());
     return;
@@ -195,8 +207,9 @@ void YoloObjectDetector::cameraCallback(const sensor_msgs::ImageConstPtr& msg)
   if (cam_image) {
     {
       boost::unique_lock<boost::shared_mutex> lockImageCallback(mutexImageCallback_);
-      imageHeader_ = msg->header;
+      imageHeader_ = msg1->header;
       camImageCopy_ = cam_image->image.clone();
+      depthImageCopy_ = depth_image->image.clone();
     }
     {
       boost::unique_lock<boost::shared_mutex> lockImageStatus(mutexImageStatus_);
@@ -630,6 +643,12 @@ void *YoloObjectDetector::publishInThread()
     boundingBoxesResults_.header.frame_id = "detection";
     boundingBoxesResults_.image_header = headerBuff_[(buffIndex_ + 1) % 3];
     boundingBoxesPublisher_.publish(boundingBoxesResults_);
+
+    //Send move base goal
+    if (publishGoal_)
+      publishGoal();
+
+
   } else {
     darknet_ros_msgs::ObjectCount msg;
     msg.header.stamp = ros::Time::now();
@@ -649,9 +668,109 @@ void *YoloObjectDetector::publishInThread()
     rosBoxes_[i].clear();
     rosBoxCounter_[i] = 0;
   }
-
   return 0;
 }
 
+void YoloObjectDetector::publishGoal()
+{
+  int max_xdiff = 0, max_ydiff = 0, max_box = 0, count = 0;
+  for (auto& i : boundingBoxesResults_.bounding_boxes)
+  {
+    if ((i.xmax - i.xmin) + (i.ymax - i.ymin) > max_xdiff + max_ydiff)
+    {
+      max_xdiff = i.xmax - i.xmin;
+      max_ydiff = i.ymax - i.ymin;
+      max_box = count;
+    }
+    count++;
+  }
+
+  std::cout<<"box size is:"<<max_xdiff+max_ydiff<<std::endl;
+  int x_min = boundingBoxesResults_.bounding_boxes[max_box].xmin;
+  int x_max = boundingBoxesResults_.bounding_boxes[max_box].xmax;
+  int y_min = boundingBoxesResults_.bounding_boxes[max_box].ymin;
+  int y_max = boundingBoxesResults_.bounding_boxes[max_box].ymax;
+  cv::Rect region_of_interest = cv::Rect(x_min, y_min, x_max-x_min, y_max-y_min);
+  cv::Mat image_roi;
+  {
+    boost::shared_lock<boost::shared_mutex> lock(mutexImageCallback_);
+    image_roi = depthImageCopy_(region_of_interest);
+   }
+
+  // Remove NANs
+  patchNaNs(image_roi, 0.0);
+
+  // Compute max histogram in depth image
+  int vbins = 25;
+  int histSize[] = { vbins };
+  cv::MatND hist;
+
+  float v_ranges[] = {0.1f, 5};
+  const float* ranges[] = {v_ranges};
+  int channels[] = {0};
+  calcHist( &image_roi, 1, channels, cv::Mat(), // do not use mask
+           hist, 1, histSize, ranges,
+           true, // the histogram is uniform
+           false );
+  cv::Point maxP;
+  double maxVal = 0;
+  minMaxLoc(hist, nullptr, nullptr, nullptr, &maxP);
+  float depth = v_ranges[0] + (v_ranges[1]-v_ranges[0])/vbins*(maxP.y+0.5f);
+
+  // Compute direct mean
+//  float depth = mean(image_roi)[0];
+
+  float angle = -(float((x_max+ x_min))/2 - 320)/320 * 0.6f;
+
+  float x_= depth * cos (angle);
+  float y_= depth * sin (angle);
+//  std::cout << "x is" << x_ << " y is "<<  y_ << std::endl;
+
+  if (depth < 6){
+    tf::StampedTransform map_to_camera_link_transform_;
+    tf::Transform human_map_transform_;
+    tf::Transform human_camera_transform_;
+    geometry_msgs::PoseStamped goal;
+    geometry_msgs::PoseStamped goal_map;
+
+    // Get transform in camera link frame
+    tf2::Quaternion myQuaternion;
+    if (abs(x_) > 0.001f){
+      myQuaternion.setRPY( 0, 0, atan(y_/x_));
+    }
+    else{
+      myQuaternion.setRPY( 0, 0, 0 );
+    }
+    myQuaternion.normalize();
+    goal.header.frame_id = "camera_link";
+    goal.header.stamp = ros::Time::now();
+    goal.pose.position.x = x_; //(abs(x_)-abs(threshold*cos(atan(y_/x_))))*(x_)/abs(x_);
+    goal.pose.position.y = y_; //(abs(y_)-abs(threshold*sin(atan(y_/x_))))*(y_)/abs(y_);
+    goal.pose.position.z = 0;
+    goal.pose.orientation.x = myQuaternion.x();
+    goal.pose.orientation.y = myQuaternion.y();
+    goal.pose.orientation.z = myQuaternion.z();
+    goal.pose.orientation.w = myQuaternion.w();
+    tf::poseMsgToTF(goal.pose, human_camera_transform_);
+
+    // Get robot angle
+    try {
+        listener_.lookupTransform("map", "camera_link", ros::Time(0), map_to_camera_link_transform_);
+    }
+    catch (tf::TransformException& ex)
+    {
+        ROS_ERROR("map_tf exception: %s", ex.what());
+        ros::Duration(2.0).sleep();
+    }
+    human_map_transform_ = map_to_camera_link_transform_ * human_camera_transform_;
+
+    tf::poseTFToMsg(human_map_transform_, goal_map.pose);
+
+    goal_map.header.frame_id = "map";
+    goal_map.header.stamp = ros::Time::now();
+    if (isnan(goal_map.pose.position.x) == 0)
+      pub_goal.publish(goal_map);
+  }
+}
 
 } /* namespace darknet_ros*/

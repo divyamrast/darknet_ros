@@ -25,6 +25,13 @@
 #include <sensor_msgs/Image.h>
 #include <geometry_msgs/Point.h>
 #include <image_transport/image_transport.h>
+#include <image_transport/subscriber_filter.h>
+#include "message_filters/subscriber.h"
+#include "message_filters/synchronizer.h"
+#include "message_filters/sync_policies/approximate_time.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
+#include "tf/tf.h"
+#include "tf/transform_listener.h"
 
 // OpenCv
 #include <opencv2/imgproc/imgproc.hpp>
@@ -105,7 +112,7 @@ class YoloObjectDetector
    * Callback of camera.
    * @param[in] msg image pointer.
    */
-  void cameraCallback(const sensor_msgs::ImageConstPtr& msg);
+  void cameraCallback(const sensor_msgs::ImageConstPtr& msg1, const sensor_msgs::ImageConstPtr& msg2);
 
   /*!
    * Check for objects action goal callback.
@@ -145,11 +152,19 @@ class YoloObjectDetector
 
   //! Advertise and subscribe to image topics.
   image_transport::ImageTransport imageTransport_;
+  typedef image_transport::SubscriberFilter ImageSubscriber;
 
   //! ROS subscriber and publisher.
   image_transport::Subscriber imageSubscriber_;
   ros::Publisher objectPublisher_;
+  ros::Publisher pub_goal;
   ros::Publisher boundingBoxesPublisher_;
+  ImageSubscriber depthImage_;
+  ImageSubscriber cameraImage_;
+  tf::TransformListener listener_;
+  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> sync_policy;
+  typedef message_filters::Synchronizer<sync_policy> Sync;
+  boost::shared_ptr<Sync> sync;
 
   //! Detected objects.
   std::vector<std::vector<RosBox_> > rosBoxes_;
@@ -200,9 +215,11 @@ class YoloObjectDetector
   int waitKeyDelay_;
   int fullScreen_;
   char *demoPrefix_;
+  bool publishGoal_;
 
   std_msgs::Header imageHeader_;
   cv::Mat camImageCopy_;
+  cv::Mat depthImageCopy_;
   boost::shared_mutex mutexImageCallback_;
 
   bool imageStatus_ = false;
@@ -246,6 +263,8 @@ class YoloObjectDetector
   bool isNodeRunning(void);
 
   void *publishInThread();
+
+  void publishGoal();
 };
 
 } /* namespace darknet_ros*/
