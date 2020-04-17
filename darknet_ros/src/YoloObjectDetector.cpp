@@ -686,6 +686,11 @@ void YoloObjectDetector::publishGoal()
   }
 
   std::cout<<"box size is:"<<max_xdiff+max_ydiff<<std::endl;
+
+  //Ignore very small detected humans (could possibly be outliers)
+  if (max_xdiff+max_ydiff < 200)
+    return;
+
   int x_min = boundingBoxesResults_.bounding_boxes[max_box].xmin;
   int x_max = boundingBoxesResults_.bounding_boxes[max_box].xmax;
   int y_min = boundingBoxesResults_.bounding_boxes[max_box].ymin;
@@ -718,7 +723,7 @@ void YoloObjectDetector::publishGoal()
   float depth = v_ranges[0] + (v_ranges[1]-v_ranges[0])/vbins*(maxP.y+0.5f);
 
   // Compute direct mean
-//  float depth = mean(image_roi)[0];
+  //  float depth = mean(image_roi)[0];
 
   float angle = -(float((x_max+ x_min))/2 - 320)/320 * 0.6f;
 
@@ -755,12 +760,12 @@ void YoloObjectDetector::publishGoal()
 
     // Get robot angle
     try {
-        listener_.lookupTransform("map", "camera_link", ros::Time(0), map_to_camera_link_transform_);
+      listener_.lookupTransform("map", "camera_link", ros::Time(0), map_to_camera_link_transform_);
     }
     catch (tf::TransformException& ex)
     {
-        ROS_ERROR("map_tf exception: %s", ex.what());
-        ros::Duration(2.0).sleep();
+      ROS_ERROR("map_tf exception: %s", ex.what());
+      ros::Duration(2.0).sleep();
     }
     human_map_transform_ = map_to_camera_link_transform_ * human_camera_transform_;
 
